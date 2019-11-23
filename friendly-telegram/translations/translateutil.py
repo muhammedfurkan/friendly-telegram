@@ -22,7 +22,7 @@ from .. import loader, utils
 
 
 def ui():
-    mods = filter(lambda x: (len(x) > 3 and x[-3:] == '.py'),
+    mods = filter(lambda x: (len(x) > 3 and x[-3:] == ".py"),
                   os.listdir(os.path.join(utils.get_base_dir(), loader.MODULES_NAME)))
     finder = UsageFinder()
     for mod in mods:
@@ -57,10 +57,12 @@ class UsageFinder(ast.NodeVisitor):
     def visit_Call(self, node):
         self.generic_visit(node)
         if isinstance(node.func, ast.Name) and node.func.id == "_" and len(node.args) == 1:
-            if isinstance(node.args[0], ast.Str) and len(node.keywords) == 0:
+            if len(node.keywords) == 0 and (isinstance(node.args[0], ast.Str)
+                                            or (isinstance(node.args[0], ast.Constant)
+                                                and isinstance(node.args[0].value, str))):
                 self._output += [node.args[0].s]
             else:
-                print("W: Could not process " + ast.dump(node))
+                print("W: Could not process " + ast.dump(node))  # noqa: T001
 
     def get_output(self):
         return self._output

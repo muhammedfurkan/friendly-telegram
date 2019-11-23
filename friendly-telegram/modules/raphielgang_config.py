@@ -17,35 +17,27 @@
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import logging
+import itertools
 
-from .. import loader, utils
+import userbot  # see .compat
+from .. import loader
 
 logger = logging.getLogger(__name__)
 
 
 def register(cb):
-    cb(ForwardMod())
+    cb(RaphielgangConfig())
 
 
-class ForwardMod(loader.Module):
-    """Forwards messages"""
+class RaphielgangConfig(loader.Module):
+    """Stores configuration for Raphielgang modules"""
     def __init__(self):
-        self.name = _("Forwarding")
+        self.config = filter(lambda x: len(x) and x.upper() == x, userbot.__all__)
+        self.config = loader.ModuleConfig(*itertools.chain.from_iterable([(x, None, "External configuration item")
+                                                                          for x in self.config]))
+        self.name = _("Raphielgang Configuration Placeholder")
 
-    async def fwdallcmd(self, message):
-        """.fwdall <to_user>
-           Forwards all messages in chat"""
-        user = utils.get_args(message)[0]
-        msgs = []
-        async for msg in message.client.iter_messages(
-                entity=message.to_id,
-                reverse=True):
-            msgs += [msg.id]
-            if len(msgs) >= 100:
-                logger.debug(msgs)
-                await message.client.forward_messages(user, msgs, message.from_id)
-                msgs = []
-            # No async list comprehension in 3.5
-        if len(msgs) > 0:
-            logger.debug(msgs)
-            await message.client.forward_messages(user, msgs, message.from_id)
+    def config_complete(self):
+        for key, value in self.config.items():
+            if value is not None:
+                setattr(userbot, key, value)

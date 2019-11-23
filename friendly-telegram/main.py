@@ -21,16 +21,24 @@ import argparse
 import asyncio
 import json
 import functools
-import atexit
 import collections
+import sqlite3
+import importlib
+import shlex
 
 from telethon import TelegramClient, events
-from telethon.errors.rpcerrorlist import PhoneNumberInvalidError, MessageNotModifiedError
+from telethon.sessions import StringSession
+from telethon.errors.rpcerrorlist import PhoneNumberInvalidError, MessageNotModifiedError, ApiIdInvalidError
+from telethon.tl.functions.channels import DeleteChannelRequest
 
 from . import utils, loader
 
-from .database import backend, frontend
+
+from .database import backend, local_backend, frontend
 from .translations.core import Translator
+from .web import core
+
+importlib.import_module(".modules", __package__)  # Required on 3.5 only
 
 
 class MemoryHandler(logging.Handler):
@@ -48,14 +56,16 @@ class MemoryHandler(logging.Handler):
         self.lvl = level
 
     def dump(self):
+        """Return a list of logging entries"""
         return self.handledbuffer + self.buffer
 
     def dumps(self, lvl=0):
+        """Return all entries of minimum level as list of strings"""
         return [self.target.format(record) for record in (self.buffer + self.handledbuffer) if record.levelno >= lvl]
 
     def emit(self, record):
         if len(self.buffer) + len(self.handledbuffer) >= self.capacity:
-            if len(self.handledbuffer):
+            if self.handledbuffer:
                 del self.handledbuffer[0]
             else:
                 del self.buffer[0]
@@ -63,24 +73,28 @@ class MemoryHandler(logging.Handler):
         if record.levelno >= self.lvl and self.lvl >= 0:
             self.acquire()
             try:
-                for record in self.buffer:
-                    self.target.handle(record)
+                for precord in self.buffer:
+                    self.target.handle(precord)
                 self.handledbuffer = self.handledbuffer[-(self.capacity - len(self.buffer)):] + self.buffer
                 self.buffer = []
             finally:
                 self.release()
 
 
-formatter = logging.Formatter(logging.BASIC_FORMAT, "")
-handler = logging.StreamHandler()
-handler.setFormatter(formatter)
-logging.getLogger().addHandler(MemoryHandler(handler, 500))
+_formatter = logging.Formatter(logging.BASIC_FORMAT, "")  # pylint: disable=C0103
+_handler = logging.StreamHandler()  # pylint: disable=C0103
+_handler.setFormatter(_formatter)
+logging.getLogger().addHandler(MemoryHandler(_handler, 500))
 logging.getLogger().setLevel(0)
+logging.captureWarnings(True)
 
 
 async def handle_command(modules, db, event):
+    """Handle all commands"""
     prefix = db.get(__name__, "command_prefix", False) or "."  # Empty string evaluates to False, so the `or` activates
-    if not (hasattr(event, "message") and getattr(event.message, "message", "")[0:len(prefix)] == prefix):
+    if not hasattr(event, "message") or getattr(event.message, "message", "") == "":
+        return
+    if event.message.message[0:len(prefix)] != prefix:
         return
     logging.debug("Incoming command!")
     if not event.message:
@@ -95,13 +109,20 @@ async def handle_command(modules, db, event):
         logging.debug("Message is blacklisted")
         return
     if len(message.message) > len(prefix) and message.message[:len(prefix) * 2] == prefix * 2 \
-            and message.message != len(message.message) * prefix:
+            and message.message != len(message.message) // len(prefix) * prefix:
         # Allow escaping commands using .'s
         await message.edit(utils.escape_html(message.message[len(prefix):]))
     logging.debug(message)
     # Make sure we don't get confused about spaces or other shit in the prefix
     message.message = message.message[len(prefix):]
-    command = message.message.split(' ', 1)[0]
+    try:
+        shlex.split(message.message)
+    except ValueError as e:
+        await message.edit("Invalid Syntax: " + str(e))
+        return
+    if not message.message:
+        return  # Message is just the prefix
+    command = message.message.split(maxsplit=1)[0]
     logging.debug(command)
     coro = modules.dispatch(command, message)  # modules.dispatch is not a coro, but returns one
     if coro is not None:
@@ -118,6 +139,7 @@ async def handle_command(modules, db, event):
 
 
 async def handle_incoming(modules, db, event):
+    """Handle all incoming messages"""
     logging.debug("Incoming message!")
     message = utils.censor(event.message)
     logging.debug(message)
@@ -132,64 +154,88 @@ async def handle_incoming(modules, db, event):
             logging.exception("Error running watcher")
 
 
-def run_config(db, phone=None):
+def run_config(db, phone=None, modules=None):
+    """Load configurator.py"""
     from . import configurator
-    return configurator.run(db, phone, phone is None)
+    return configurator.run(db, phone, phone is None, modules)
 
 
-def main():
+def parse_arguments():
+    """Parse the arguments"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--setup", "-s", action="store_true")
     parser.add_argument("--phone", "-p", action="append")
     parser.add_argument("--token", "-t", action="append", dest="tokens")
     parser.add_argument("--heroku", action="store_true")
     parser.add_argument("--translate", action="store_true")
+    parser.add_argument("--local-db", dest="local", action="store_true")
+    parser.add_argument("--web-only", dest="web_only", action="store_true")
     arguments = parser.parse_args()
     logging.debug(arguments)
+    if sys.platform == "win32":
+        # Subprocess support; not needed in 3.8 but not harmful
+        asyncio.set_event_loop(asyncio.ProactorEventLoop())
+
+    return arguments
+
+
+def get_phones(arguments):
+    """Get phones from the --token, --phone, and environment"""
+    phones = set(arguments.phone if arguments.phone else [])
+    phones.update(map(lambda f: f[18:-8],
+                      filter(lambda f: f.startswith("friendly-telegram-") and f.endswith(".session"),
+                             os.listdir(os.path.dirname(utils.get_base_dir())))))
+
+    authtoken = os.environ.get("authorization_strings", False)  # for heroku
+    if authtoken and not arguments.setup:
+        try:
+            authtoken = json.loads(authtoken)
+        except json.decoder.JSONDecodeError:
+            logging.warning("authtoken invalid")
+            authtoken = False
+
+    if arguments.tokens and not authtoken:
+        authtoken = {}
+    if arguments.tokens:
+        for token in arguments.tokens:
+            phone = sorted(phones).pop(0)
+            phones.remove(phone)  # Handled seperately by authtoken logic
+            authtoken.update(**{phone: token})
+    return phones, authtoken
+
+
+def get_api_token():
+    """Get API Token from disk or environment"""
+    while True:
+        try:
+            from . import api_token
+        except ImportError:
+            try:
+                api_token = collections.namedtuple("api_token", ["ID", "HASH"])(os.environ["api_id"],
+                                                                                os.environ["api_hash"])
+            except KeyError:
+                run_config({})
+            else:
+                return api_token
+        else:
+            return api_token
+
+
+def main():
+    """Main entrypoint"""
+    arguments = parse_arguments()
 
     if arguments.translate:
         from .translations import translateutil
         translateutil.ui()
         return
 
-    if sys.platform == 'win32':
-        # Subprocess support
-        asyncio.set_event_loop(asyncio.ProactorEventLoop())
-
     clients = []
+    phones, authtoken = get_phones(arguments)
+    api_token = get_api_token()
+    if api_token is None:
+        return
 
-    phones = arguments.phone if arguments.phone else []
-    phones += set(map(lambda f: f[18:-8], filter(lambda f: f[:19] == "friendly-telegram-+" and f[-8:] == ".session",
-                                                 os.listdir(os.path.dirname(utils.get_base_dir())))))
-
-    authtoken = os.environ.get("authorization_strings", False)  # for heroku
-    if authtoken:
-        authtoken = json.loads(authtoken)
-
-    if arguments.tokens and not authtoken:
-        authtoken = {}
-    if arguments.tokens:
-        for token in arguments.tokens:
-            phone = phones.pop(0)
-            authtoken.update(**{phone: token})
-    if authtoken or arguments.heroku:
-        from telethon.sessions import StringSession
-    if arguments.heroku:
-        def session_name(phone):
-            return StringSession()
-    else:
-        def session_name(phone):
-            return os.path.join(os.path.dirname(utils.get_base_dir()),
-                                "friendly-telegram" + (("-" + phone) if phone else ""))
-    try:
-        from . import api_token
-    except ImportError:
-        try:
-            api_token = collections.namedtuple("api_token", ["ID", "HASH"])(os.environ["api_id"],
-                                                                            os.environ["api_hash"])
-        except KeyError:
-            run_config({})
-            return
     if authtoken:
         for phone, token in authtoken.items():
             try:
@@ -199,38 +245,40 @@ def main():
                 run_config({})
                 return
             clients[-1].phone = phone  # for consistency
-    if os.path.isfile(os.path.join(os.path.dirname(utils.get_base_dir()), 'friendly-telegram.session')):
-        try:
-            clients += [TelegramClient(session_name(None), api_token.ID, api_token.HASH).start()]
-        except ValueError:
-            run_config({})
-            return
-        print("You're using the legacy session format. Please contact support, this will break in a future update.")
     if len(clients) == 0 and len(phones) == 0:
-        phones += [input("Please enter your phone: ")]
+        phones = [input("Please enter your phone: ")]
     for phone in phones:
         try:
-            try:
-                clients += [TelegramClient(session_name(phone), api_token.ID, api_token.HASH,
-                            connection_retries=None).start(phone)]
-            except ValueError:
-                run_config({})
-                return
-            clients[-1].phone = phone  # so we can format stuff nicer in configurator
-        except PhoneNumberInvalidError:
-            print("Please check the phone number. Use international format (+XX...) and don't put spaces in it.")
+            clients += [TelegramClient(StringSession() if arguments.heroku else
+                                       os.path.join(os.path.dirname(utils.get_base_dir()), "friendly-telegram"
+                                                    + (("-" + phone) if phone else "")), api_token.ID,
+                                       api_token.HASH, connection_retries=None).start(phone)]
+        except sqlite3.OperationalError as ex:
+            print("Error initialising phone " + (phone if phone else "unknown") + " " + ",".join(ex.args)  # noqa: T001
+                  + ": this is probably your fault. Try checking that this is the only instance running and "
+                  "that the session is not copied. If that doesn't help, delete the file named '"
+                  "friendly-telegram" + (("-" + phone) if phone else "") + ".session'")
+            continue
+        except (ValueError, ApiIdInvalidError):
+            # Bad API hash/ID
+            run_config({})
             return
+        except PhoneNumberInvalidError:
+            print("Please check the phone number. Use international format (+XX...)"  # noqa: T001
+                  " and don't put spaces in it.")
+            continue
+        clients[-1].phone = phone  # so we can format stuff nicer in configurator
 
     if arguments.heroku:
-        key = input("Please enter your Heroku API key: ").strip()
+        key = input("Please enter your Heroku API key (from https://dashboard.heroku.com/account): ").strip()
         from . import heroku
         heroku.publish(clients, key, api_token)
+        print("Installed to heroku successfully! Type .help in Telegram for help.")  # noqa: T001
         return
 
-    loops = []
-    for client in clients:
-        atexit.register(client.disconnect)
-        loops += [amain(client, clients, arguments.setup)]
+    web = core.Web()
+
+    loops = [amain(client, clients, web, arguments.setup, arguments.local, arguments.web_only) for client in clients]
 
     asyncio.get_event_loop().set_exception_handler(lambda _, x:
                                                    logging.error("Exception on event loop! %s", x["message"],
@@ -238,41 +286,56 @@ def main():
     asyncio.get_event_loop().run_until_complete(asyncio.gather(*loops))
 
 
-async def amain(client, allclients, setup=False):
-    async with client as c:
-        await c.start()
-        c.parse_mode = "HTML"
+async def amain(client, allclients, web, setup=False, local=False, web_only=False):
+    """Entrypoint for async init, run once for each user"""
+    async with client:
+        client.parse_mode = "HTML"
+        await client.start()
+        [handler] = logging.getLogger().handlers
+        dbc = local_backend.LocalBackend if local else backend.CloudBackend
         if setup:
-            db = backend.CloudBackend(c)
+            db = dbc(client)
             await db.init(lambda e: None)
             jdb = await db.do_download()
             try:
                 pdb = json.loads(jdb)
             except (json.decoder.JSONDecodeError, TypeError):
                 pdb = {}
-            pdb = run_config(pdb, getattr(c, "phone", "Unknown Number"))
+            modules = loader.Modules()
+            modules.register_all(Translator())
+            fdb = frontend.Database(None)
+            await fdb.init()
+            modules.send_config(fdb)
+            await modules.send_ready(client, fdb, allclients)  # Allow normal init even in setup
+            handler.setLevel(50)
+            pdb = run_config(pdb, getattr(client, "phone", "Unknown Number"), modules)
+            if pdb is None:
+                await client(DeleteChannelRequest(db.db))
+                return
             try:
                 await db.do_upload(json.dumps(pdb))
             except MessageNotModifiedError:
                 pass
             return
-        db = frontend.Database(backend.CloudBackend(c))
+        db = frontend.Database(dbc(client))
         await db.init()
         logging.debug("got db")
         logging.info("Loading logging config...")
-        [handler] = logging.getLogger().handlers
         handler.setLevel(db.get(__name__, "loglevel", logging.WARNING))
 
-        babelfish = Translator(["en"])  # TODO
+        babelfish = Translator(db.get(__name__, "language", ["en"]))
 
         modules = loader.Modules()
-        modules.register_all(db.get(__name__, "disable_modules", []), babelfish)
+        modules.register_all(babelfish)
 
         modules.send_config(db)
         await modules.send_ready(client, db, allclients)
-        client.add_event_handler(functools.partial(handle_incoming, modules, db),
-                                 events.NewMessage(incoming=True))
-        client.add_event_handler(functools.partial(handle_command, modules, db),
-                                 events.NewMessage(outgoing=True, forwards=False))
-        print("Started")
-        await c.run_until_disconnected()
+        if not web_only:
+            client.add_event_handler(functools.partial(handle_incoming, modules, db),
+                                     events.NewMessage(incoming=True))
+            client.add_event_handler(functools.partial(handle_command, modules, db),
+                                     events.NewMessage(outgoing=True, forwards=False))
+        print("Started for " + str((await client.get_me(True)).user_id))  # noqa: T001
+        await web.add_loader(client, modules, db)
+        await web.start_if_ready(len(allclients))
+        await client.run_until_disconnected()

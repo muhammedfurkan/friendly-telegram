@@ -14,6 +14,8 @@
 #    You should have received a copy of the GNU Affero General Public License
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+"""Loads modules from disk and dispatches stuff, and stores state"""
+
 import importlib
 import importlib.util
 import os
@@ -27,24 +29,33 @@ MODULES_NAME = "modules"
 
 
 class ModuleConfig(dict):
+    """Like a dict but contains doc for each key"""
     def __init__(self, *entries):
         i = 0
         keys = []
         values = []
+        defaults = []
         docstrings = []
         for entry in entries:
             if i % 3 == 0:
                 keys.append(entry)
             elif i % 3 == 1:
                 values.append(entry)
+                defaults.append(entry)
             else:
                 docstrings.append(entry)
             i += 1
         super().__init__(zip(keys, values))
-        self.docstrings = dict(zip(keys, docstrings))
+        self._docstrings = dict(zip(keys, docstrings))
+        self._defaults = dict(zip(keys, defaults))
 
     def getdoc(self, key):
-        return self.docstrings[key]
+        """Get the documentation by key"""
+        return self._docstrings[key]
+
+    def getdef(self, key):
+        """Get the default value by key"""
+        return self._defaults[key]
 
 
 class Module():
@@ -53,23 +64,36 @@ class Module():
         self.name = "Unknown"
 
     def config_complete(self):
-        pass
+        """Will be called when module.config is populated"""
 
-    # Will always be called after config loaded.
     async def client_ready(self, client, db):
+        """Will be called after client is ready (after config_loaded)"""
+
+    # Called after client_ready, for internal use only. Must not be used by non-core modules
+    async def _client_ready2(self, client, db):
         pass
 
 
 class Modules():
+    """Stores all registered modules"""
+    instances = []
+
     def __init__(self):
         self.commands = {}
+        self.aliases = {}
         self.modules = []
         self.watchers = []
+        self._compat_layer = None
+        self._log_handlers = []
+        self.instances.append(self)
+        self.client = None
 
-    def register_all(self, skip, babelfish):
-        from .compat import uniborg  # Uniborg is disabled because it Doesn't Work™️.
-        from . import compat  # Avoid circular import
-        self._compat_layer = compat.activate([])
+    def register_all(self, babelfish):
+        """Load all modules in the module directory"""
+        if self._compat_layer is None:
+            from .compat import uniborg
+            from . import compat  # Avoid circular import
+            self._compat_layer = compat.activate([])
         logging.debug(os.listdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), MODULES_NAME)))
         mods = filter(lambda x: (len(x) > 3 and x[-3:] == ".py" and x[0] != "_"),
                       os.listdir(os.path.join(utils.get_base_dir(), MODULES_NAME)))
@@ -77,33 +101,37 @@ class Modules():
         for mod in mods:
             try:
                 module_name = __package__ + "." + MODULES_NAME + "." + mod[:-3]  # FQN
-                if module_name in skip:
-                    logging.debug("Not loading module %s because it is blacklisted", module_name)
-                    continue
                 logging.debug(module_name)
                 logging.debug(os.path.join(utils.get_base_dir(), MODULES_NAME, mod))
                 spec = importlib.util.spec_from_file_location(module_name,
                                                               os.path.join(utils.get_base_dir(), MODULES_NAME, mod))
                 module = importlib.util.module_from_spec(spec)
-                module.borg = uniborg.UniborgClient()  # Uniborg is disabled because it Doesn't Work™️.
                 sys.modules[module_name] = module  # Do this early for the benefit of RaphielGang compat layer
+                module.borg = uniborg.UniborgClient(module_name)
                 spec.loader.exec_module(module)
                 module._ = babelfish.gettext
                 try:
                     module.register(self.register_module, module_name)
                 except TypeError:  # Too many arguments
                     module.register(self.register_module)
-            except BaseException as e:
+            except BaseException:
                 logging.exception("Failed to load module %s due to:", mod)
 
     def register_module(self, instance):
-        if not issubclass(instance.__class__, Module):
+        """Register single module instance"""
+        if not issubclass(type(instance), Module):
             logging.error("Not a subclass %s", repr(instance.__class__))
         if not hasattr(instance, "commands"):
             # https://stackoverflow.com/a/34452/5509575
             instance.commands = {method_name[:-3]: getattr(instance, method_name) for method_name in dir(instance)
                                  if callable(getattr(instance, method_name)) and method_name[-3:] == "cmd"}
 
+        self.register_commands(instance)
+        self.register_watcher(instance)
+        self.complete_registration(instance)
+
+    def register_commands(self, instance):
+        """Register commands from instance"""
         for command in instance.commands:
             # Verify that command does not already exist, or, if it does, the command must be from the same class name
             if command.lower() in self.commands.keys():
@@ -113,43 +141,63 @@ class Modules():
                         != self.commands[command].__self__.__class__.__name__:
                     logging.error("Duplicate command %s", command)
                     continue
-                else:
-                    logging.debug("Replacing command for update " + repr(self.commands[command]))
+                logging.debug("Replacing command for update %r", self.commands[command])
             if not instance.commands[command].__doc__:
                 logging.warning("Missing docs for %s", command)
             self.commands.update({command.lower(): instance.commands[command]})
+
+    def register_watcher(self, instance):
+        """Register watcher from instance"""
         try:
             if instance.watcher:
                 for watcher in self.watchers:
                     if hasattr(watcher, "__self__") and watcher.__self__.__class__.__name__ \
                             == instance.watcher.__self__.__class__.__name__:
-                        logging.debug("Removing watcher for update " + repr(watcher))
+                        logging.debug("Removing watcher for update %r", watcher)
                         self.watchers.remove(watcher)
                 self.watchers += [instance.watcher]
         except AttributeError:
             pass
-        if hasattr(instance, "allmodules"):
-            # Mainly for the Help module
-            instance.allmodules = self
+
+    def complete_registration(self, instance):
+        """Complete registration of instance"""
+        # Mainly for the Help module
+        instance.allmodules = self
+        # And for Remote
+        instance.allloaders = self.instances
+        instance.log = self.log  # Like botlog from PP
         for module in self.modules:
             if module.__class__.__name__ == instance.__class__.__name__:
-                logging.debug("Removing module for update " + repr(module))
+                logging.debug("Removing module for update %r", module)
                 self.modules.remove(module)
         self.modules += [instance]
 
     def dispatch(self, command, message):
+        """Dispatch command to appropriate module"""
         logging.debug(self.commands)
+        logging.debug(self.aliases)
         for com in self.commands:
-            logging.debug(com)
             if command.lower() == com:
                 logging.debug("found command")
                 return self.commands[com](message)  # Returns a coroutine
+        for alias in self.aliases:
+            if alias.lower() == command.lower():
+                logging.debug("found alias")
+                com = self.aliases[alias]
+                try:
+                    message.message = com + message.message[len(command):]
+                    return self.commands[com](message)
+                except KeyError:
+                    logging.warning("invalid alias")
+        return None
 
-    def send_config(self, db):
+    def send_config(self, db, skip_hook=False):
+        """Configure modules"""
         for mod in self.modules:
-            self.send_config_one(mod, db)
+            self.send_config_one(mod, db, skip_hook)
 
-    def send_config_one(self, mod, db):
+    def send_config_one(self, mod, db, skip_hook=False):  # pylint: disable=R0201
+        """Send config to single instance"""
         if hasattr(mod, "config"):
             modcfg = db.get(mod.__module__, "__config__", {})
             logging.debug(modcfg)
@@ -158,37 +206,77 @@ class Modules():
                 if conf in modcfg.keys():
                     mod.config[conf] = modcfg[conf]
                 else:
-                    logging.debug("No config value for " + conf)
+                    try:
+                        mod.config[conf] = os.environ[mod.__module__ + "." + conf]
+                        logging.debug("Loaded config key %s from environment", conf)
+                    except KeyError:
+                        logging.debug("No config value for %s", conf)
+                        mod.config[conf] = mod.config.getdef(conf)
             logging.debug(mod.config)
+        if skip_hook:
+            return
         try:
             mod.config_complete()
         except Exception:
             logging.exception("Failed to send mod config complete signal")
 
     async def send_ready(self, client, db, allclients):
+        """Send all data to all modules"""
+        self.client = client
         await self._compat_layer.client_ready(client)
         try:
-            for m in self.modules:
-                m.allclients = allclients
-            await asyncio.gather(*[m.client_ready(client, db) for m in self.modules])
+            for mod in self.modules:
+                mod.allclients = allclients
+            await asyncio.gather(*[mod.client_ready(client, db) for mod in self.modules])
+            await asyncio.gather(*[mod._client_ready2(client, db) for mod in self.modules])  # pylint: disable=W0212
         except Exception:
             logging.exception("Failed to send mod init complete signal")
 
     def unload_module(self, classname):
-        worked = False
+        """Remove module and all stuff from it"""
+        worked = []
+        to_remove = []
         for module in self.modules:
-            if module.__class__.__name__ == classname:
-                worked = True
-                logging.debug("Removing module for unload" + repr(module))
+            if classname in (module.name, module.__class__.__name__):
+                worked += [module.__module__]
+                logging.debug("Removing module for unload %r", module)
                 self.modules.remove(module)
-        for watcher in self.watchers:
-            if hasattr(watcher, "__self__") and watcher.__self__.__class__.__name__ == classname:
-                worked = True
-                logging.debug("Removing watcher for unload " + repr(watcher))
+                to_remove += module.commands.values()
+                if hasattr(module, "watcher"):
+                    to_remove += [module.watcher]
+        logging.debug("to_remove: %r", to_remove)
+        for watcher in self.watchers.copy():
+            if watcher in to_remove:
+                logging.debug("Removing watcher for unload %r", watcher)
                 self.watchers.remove(watcher)
-        for command in self.commands:
-            if hasattr(command, "__self__") and command.__self__.__class__.__name__ == classname:
-                worked = True
-                logging.debug("Removing command for unload " + repr(command))
-                self.commands.remove(command)
+        aliases_to_remove = []
+        for name, command in self.commands.copy().items():
+            if command in to_remove:
+                logging.debug("Removing command for unload %r", command)
+                del self.commands[name]
+                aliases_to_remove.append(name)
+        for alias, command in self.aliases.copy().items():
+            if command in aliases_to_remove:
+                del self.aliases[alias]
         return worked
+
+    def add_alias(self, alias, cmd):
+        """Make an alias"""
+        if cmd not in self.commands.keys():
+            return False
+        self.aliases[alias] = cmd
+        return True
+
+    def remove_alias(self, alias):
+        """Remove an alias"""
+        try:
+            del self.aliases[alias]
+        except KeyError:
+            return False
+        return True
+
+    async def log(self, type, *, group=None, affected_uids=None, data=None):
+        return await asyncio.gather(*[fun(type, group, affected_uids, data) for fun in self._log_handlers])
+
+    def register_logger(self, logger):
+        self._log_handlers.append(logger)

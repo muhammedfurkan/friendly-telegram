@@ -16,11 +16,12 @@
 #    You should have received a copy of the GNU Affero General Public License
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from .. import loader, utils
 import logging
 import inspect
 
 from telethon.tl.functions.channels import JoinChannelRequest
+
+from .. import loader, utils
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +33,10 @@ def register(cb):
 class HelpMod(loader.Module):
     """Provides this help message"""
     def __init__(self):
+        super().__init__()
         self.name = _("Help")
         self.allmodules = None
+        self.client = None
 
     async def helpcmd(self, message):
         """.help [module]"""
@@ -47,34 +50,36 @@ class HelpMod(loader.Module):
                 await message.edit("<code>" + _("Invalid module name specified") + "</code>")
                 return
             # Translate the format specification and the module seperately
-            reply = "<code>" + _("Help for {}:").format(utils.escape_html(_(module.name))) + "\n  "
+            reply = "<b>" + _("Help for</b> <code>{}</code>:").format(utils.escape_html(_(module.name))) + "\n  "
             if module.__doc__:
                 reply += utils.escape_html(inspect.cleandoc(module.__doc__))
             else:
                 logger.warning("Module %s is missing docstring!", module)
             for name, fun in module.commands.items():
-                reply += f"\n  {name}\n"
+                reply += f"\n  <code>{name}</code>\n"
                 if fun.__doc__:
                     reply += utils.escape_html("\n".join(["    " + x for x in
                                                           _(inspect.cleandoc(fun.__doc__)).splitlines()]))
                 else:
                     reply += _("There is no documentation for this command")
         else:
-            reply = "<code>" + _("Available Modules:")
+            reply = "<b>" + _("Available Modules:") + "</b>"
             for mod in self.allmodules.modules:
-                reply += "\n  " + (_("{} has 1 command available")
-                                   .format(mod.name) if len(mod.commands) == 1 else _("{} has {} commands available")
-                                   .format(mod.name, len(mod.commands)))
+                reply += _("\n• <b>{}</b> ({})").format(mod.name, len(mod.commands))
+                first = True
                 for cmd in mod.commands:
-                    reply += f"\n    {cmd}"
-        reply += "</code>"
-        await message.edit(reply)
+                    if first:
+                        reply += f"\n  <code>{cmd}"
+                        first = False
+                    else:
+                        reply += f", {cmd}"
+                reply += "</code>"
+        await utils.answer(message, reply)
 
     async def supportcmd(self, message):
         """Joins the support chat"""
         await self.client(JoinChannelRequest("https://t.me/friendlytgbot"))
-        await message.edit('<code>' + _('Joined to '
-                           + '</code><a href="https://t.me/friendlytgbot">' + 'support chat' + '</a>'))
+        await message.edit(_("<code>Joined to</code> <a href='https://t.me/friendlytgbot'>support chat</a>"))
 
     async def client_ready(self, client, db):
         self.client = client

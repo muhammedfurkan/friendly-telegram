@@ -24,7 +24,7 @@ import telethon
 
 from telethon.tl.functions.channels import CreateChannelRequest, DeleteChannelRequest
 from telethon.tl.types import Message
-from telethon.errors.rpcerrorlist import MessageEditTimeExpiredError
+from telethon.errors.rpcerrorlist import MessageEditTimeExpiredError, MessageNotModifiedError
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,12 @@ class CloudBackend():
     def __init__(self, client):
         self._client = client
         self._me = None
-        self._db = None
+        self.db = None
+        self._assets = None
+        self._anti_double_lock = asyncio.Lock()
+        self._anti_double_asset_lock = asyncio.Lock()
+        self._data_already_exists = False
+        self._assets_already_exists = False
 
     async def init(self, trigger_refresh):
         self._me = await self._client.get_me()
@@ -49,22 +54,45 @@ class CloudBackend():
                 return dialog.entity
 
     async def _make_data_channel(self):
-        return (await self._client(CreateChannelRequest(f"friendly-{self._me.id}-data", "// Don't touch",
-                                                        megagroup=True))).chats[0]
+        async with self._anti_double_lock:
+            if not self._data_already_exists:
+                self._data_already_exists = True
+                return (await self._client(CreateChannelRequest(f"friendly-{self._me.id}-data",
+                                                                "// Don't touch", megagroup=True))).chats[0]
+            else:
+                return await self._find_data_channel()
+
+    async def _find_asset_channel(self):
+        async for dialog in self._client.iter_dialogs(None, ignore_migrated=True):
+            if dialog.name == f"friendly-{self._me.id}-assets" and dialog.is_channel:
+                members = await self._client.get_participants(dialog, limit=2)
+                if len(members) != 1:
+                    continue
+                logger.debug(f"Found asset chat! It is {dialog}.")
+                return dialog.entity
+
+    async def _make_asset_channel(self):
+        async with self._anti_double_asset_lock:
+            if not self._assets_already_exists:
+                self._assets_already_exists = True
+                return (await self._client(CreateChannelRequest(f"friendly-{self._me.id}-assets",
+                                                                "// Don't touch", megagroup=True))).chats[0]
+            else:
+                return await self._find_data_channel()
 
     async def do_download(self):
         """Attempt to download the database.
            Return the database (as unparsed JSON) or None"""
-        if not self._db:
-            self._db = await self._find_data_channel()
-            if not self._db:
+        if not self.db:
+            self.db = await self._find_data_channel()
+            if not self.db:
                 logging.debug("No DB, returning")
                 return None
             self._client.add_event_handler(self._callback,
-                                           telethon.events.messageedited.MessageEdited(chats=[self._db]))
+                                           telethon.events.messageedited.MessageEdited(chats=[self.db]))
 
         msgs = self._client.iter_messages(
-            entity=self._db,
+            entity=self.db,
             reverse=True
         )
         data = ""
@@ -82,14 +110,14 @@ class CloudBackend():
     async def do_upload(self, data):
         """Attempt to upload the database.
            Return True or throw"""
-        if not self._db:
-            self._db = await self._find_data_channel()
-            if not self._db:
-                self._db = await self._make_data_channel()
+        if not self.db:
+            self.db = await self._find_data_channel()
+            if not self.db:
+                self.db = await self._make_data_channel()
             self._client.add_event_handler(self._callback,
-                                           telethon.events.messageedited.MessageEdited(chats=[self._db]))
+                                           telethon.events.messageedited.MessageEdited(chats=[self.db]))
         msgs = await self._client.get_messages(
-            entity=self._db,
+            entity=self.db,
             reverse=True
         )
         ops = []
@@ -109,18 +137,44 @@ class CloudBackend():
                     logging.debug("maybe deleting message")
                     if not msg.id == msgs[-1].id:
                         ops += [msg.delete()]
-        try:
-            await asyncio.gather(*ops)
-        except MessageEditTimeExpiredError:
-            logging.debug("Making new channel.")
-            _db = self._db
-            self._db = None
-            await self._client(DeleteChannelRequest(channel=_db))
+
+        if await self._do_ops(ops):
             return await self.do_upload(data)
         while len(sdata):  # Only happens if newmsg is True or there was no message before
             newmsg = True
-            await self._client.send_message(self._db, utils.escape_html(sdata[:4096]))
+            await self._client.send_message(self.db, utils.escape_html(sdata[:4096]))
             sdata = sdata[4096:]
         if newmsg:
-            await self._client.send_message(self._db, "Please ignore this chat.")
+            await self._client.send_message(self.db, "Please ignore this chat.")
         return True
+
+    async def _do_ops(self, ops):
+        try:
+            for r in await asyncio.gather(*ops, return_exceptions=True):
+                if isinstance(r, MessageNotModifiedError):
+                    logging.warning("db not modified", exc_info=r)
+                elif isinstance(r, Exception):
+                    raise r  # Makes more sense to raise even for MessageEditTimeExpiredError
+                elif not isinstance(r, Message):
+                    logging.debug("unknown ret from gather, %r", r)
+        except MessageEditTimeExpiredError:
+            logging.debug("Making new channel.")
+            _db = self.db
+            self.db = None
+            await self._client(DeleteChannelRequest(channel=_db))
+            return True
+        return False
+
+    async def store_asset(self, message):
+        if not self._assets:
+            self._assets = await self._find_asset_channel()
+        if not self._assets:
+            self._assets = await self._make_asset_channel()
+        return (await self._client.send_message(self._assets, message)).id
+
+    async def fetch_asset(self, id):
+        if not self._assets:
+            self._assets = await self._find_asset_channel()
+        if not self._assets:
+            return None
+        return (await self._client.get_messages(self._assets, limit=1, max_id=id + 1, min_id=id - 1))[0]

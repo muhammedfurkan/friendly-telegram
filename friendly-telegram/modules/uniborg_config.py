@@ -1,3 +1,5 @@
+# -*- coding: future_fstrings -*-
+
 #    Friendly Telegram (telegram userbot)
 #    Copyright (C) 2018-2019 The Authors
 
@@ -14,31 +16,28 @@
 #    You should have received a copy of the GNU Affero General Public License
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from gtts import gTTS
+import logging
+import itertools
 
-from io import BytesIO
+from .. import loader
+from ..compat import uniborg
 
-from .. import loader, utils
+logger = logging.getLogger(__name__)
 
 
 def register(cb):
-    cb(TTSMod())
+    cb(UniborgConfig())
 
 
-class TTSMod(loader.Module):
+class UniborgConfig(loader.Module):
+    """Stores configuration for Uniborg modules"""
     def __init__(self):
-        self.name = "Text to speech"
+        self.config = filter(lambda x: len(x) and x.upper() == x, uniborg.UniborgConfig.__all__)
+        self.config = loader.ModuleConfig(*itertools.chain.from_iterable([(x, None, "External configuration item")
+                                                                          for x in self.config]))
+        self.name = _("Uniborg Configuration Placeholder")
 
-    async def ttscmd(self, message):
-        """Convert text to speech with Google APIs"""
-        args = utils.get_args_raw(message)
-        if not args:
-            args = (await message.get_reply_message()).message
-
-        tts = await utils.run_sync(gTTS, args)
-        voice = BytesIO()
-        tts.write_to_fp(voice)
-        voice.seek(0)
-        voice.name = "voice.mp3"
-
-        await utils.answer(message, voice, voice_note=True)
+    def config_complete(self):
+        for key, value in self.config.items():
+            if value is not None:
+                setattr(uniborg.UniborgConfig, key, value)

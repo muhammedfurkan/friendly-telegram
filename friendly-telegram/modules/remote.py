@@ -19,12 +19,13 @@
 import logging
 import inspect
 import itertools
-import telethon
 import ast
+
+import telethon
 
 from .. import loader, utils
 
-tlfuns = dict(filter(lambda mod: mod[1].__module__.startswith('telethon.tl.functions'),
+tlfuns = dict(filter(lambda mod: mod[1].__module__.startswith("telethon.tl.functions"),
                      itertools.chain.from_iterable([inspect.getmembers(mod[1], inspect.isclass)
                                                     for mod in inspect.getmembers(telethon.tl.functions,
                                                                                   inspect.ismodule)])))
@@ -38,16 +39,11 @@ def register(cb):
 
 class RemoteMod(loader.Module):
     """Operate on other accounts"""
-    instances = {}
-
     def __init__(self):
         self.config = loader.ModuleConfig("ACCOUNT_NAME", None, "What to call this account in .remote commands")
         self.name = _("Remote Control")
         self.commands = {"remote": self.remote_command}
         self.allmodules = None
-
-    async def client_ready(self, client, db):
-        self.instances[client] = self
 
     async def remote_command(self, message):
         """Execute remote command"""
@@ -100,20 +96,27 @@ class RemoteMod(loader.Module):
         if not callable(cmd):
             await message.edit(_("<code>That custom client command does not exist!</code>"))
             return
-        try:
-            args = ast.literal_eval(" ".join(args[1:]))
-        except ValueError:
-            await message.edit(_("<code>Malformed parameters</code>"))
-            return
-        except SyntaxError:
-            args = []
-        await cmd(*args)
+        fargs = []
+        for arg in args[1:]:
+            try:
+                fargs.append(ast.literal_eval(arg))
+            except (ValueError, SyntaxError):
+                fargs.append(arg)
+        logger.debug(fargs)
+        await cmd(*fargs)
 
     async def cmdcmd(self, client, args, message):
         if len(args) < 1:
             await message.edit(_("<code>What command should be executed?</code>"))
             return
-        await self.instances[client].allmodules.dispatch(args[0], message)
+        for load in self.allloaders:
+            if load.client is client:
+                break
+                # This will always be fulfilled at some point
+        logger.debug(args)
+        message.message = " ".join(args[1:])
+        msg = await message.client.send_message(args[0], message)
+        await load.dispatch(args[1], msg)
 
     async def rawcmd(self, client, args, message):
         if len(args) < 1:
